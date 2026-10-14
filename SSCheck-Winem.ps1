@@ -1,6 +1,6 @@
 #Requires -Version 5.1
 <#
-    SS CHECK - Made by Winem. DM null.mood for assistance.
+    SS CHECK - Made by Winem. DM @null.mood for assistance.
     Run in an elevated PowerShell window.
 
     Colors:  GREEN  = normal / not found
