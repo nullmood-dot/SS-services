@@ -12,6 +12,10 @@
 
     Everything is scoped to the CURRENT BOOT where it makes sense. Older records are only
     shown as gray context.
+
+    The console shows the classic event log summary. Everything else from the event logs
+    (disks, USB, virtual mounts, services, defender, code integrity, ...) lives in the
+    Event Logs Parser window at the end.
 #>
 
 $ErrorActionPreference = 'SilentlyContinue'
@@ -37,15 +41,19 @@ function Trunc { param([string]$s, [int]$n) if ($s.Length -gt $n) { $s.Substring
 function Add-Flag { param([string]$Text, [string]$Color = 'Magenta') $script:Flags.Add([pscustomobject]@{ Text = $Text; Color = $Color }) }
 
 function Write-Banner {
+    $w = 54
+    $edge = '+' + ('-' * $w) + '+'
+    $l1 = '   M A D E   B Y   W I N E M'
+    $l2 = '   DM null.mood for assistance'
     Write-Host ""
-    Write-Host "  SS CHECK" -NoNewline -ForegroundColor Magenta
-    Write-Host "  |  made by Winem  |  DM null.mood for assistance" -ForegroundColor DarkGray
-    Write-Host ("  " + ('-' * 66)) -ForegroundColor DarkMagenta
-    Write-Host "  " -NoNewline
-    Write-Host "GREEN" -NoNewline -ForegroundColor Green;   Write-Host " ok   " -NoNewline -ForegroundColor DarkGray
-    Write-Host "RED" -NoNewline -ForegroundColor Red;       Write-Host " disabled/restarted   " -NoNewline -ForegroundColor DarkGray
-    Write-Host "PURPLE" -NoNewline -ForegroundColor Magenta; Write-Host " tamper   " -NoNewline -ForegroundColor DarkGray
-    Write-Host "YELLOW" -NoNewline -ForegroundColor Yellow; Write-Host " info" -ForegroundColor DarkGray
+    Write-Host $edge -ForegroundColor DarkMagenta
+    Write-Host '|' -NoNewline -ForegroundColor DarkMagenta
+    Write-Host $l1.PadRight($w) -NoNewline -ForegroundColor Magenta
+    Write-Host '|' -ForegroundColor DarkMagenta
+    Write-Host '|' -NoNewline -ForegroundColor DarkMagenta
+    Write-Host $l2.PadRight($w) -NoNewline -ForegroundColor White
+    Write-Host '|' -ForegroundColor DarkMagenta
+    Write-Host $edge -ForegroundColor DarkMagenta
 }
 
 function Write-Section {
@@ -202,16 +210,17 @@ namespace SSCheck {
 } catch { $nativeOk = $false }
 
 # ----------------------------------------------------------------------------
-# Admin check
+# Banner + admin check
 # ----------------------------------------------------------------------------
 Write-Banner
 
+Write-Section 'ADMIN CHECK'
 $isAdmin = [System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Host ""
-    Write-Host "  Administrator privileges REQUIRED. Re-run this script as Administrator." -ForegroundColor Red
+    Write-Host 'Administrator privileges REQUIRED. Re-run this script as Administrator.' -ForegroundColor Red
     exit
 }
+Write-Host 'Administrator privileges confirmed.' -ForegroundColor Green
 if ($nativeOk) { [void][SSCheck.Native]::EnableDebug() }
 
 # ----------------------------------------------------------------------------
@@ -704,7 +713,7 @@ if (Test-Path $recent) {
 }
 
 # ----------------------------------------------------------------------------
-# PowerShell logging (policies + PSReadLine + command history file)
+# PowerShell logging (clear status + policies + PSReadLine + command history file)
 # ----------------------------------------------------------------------------
 Write-Section 'POWERSHELL LOGGING'
 
@@ -719,17 +728,37 @@ function Show-Policy {
     } else { Write-Item $Label 'Enabled' 'Green' }
 }
 $polRoot = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\PowerShell'
+$sblVal = Get-PolValue "$polRoot\ScriptBlockLogging" 'EnableScriptBlockLogging'
+$modVal = Get-PolValue "$polRoot\ModuleLogging" 'EnableModuleLogging'
+$psLog = Get-WinEvent -ListLog 'Microsoft-Windows-PowerShell/Operational' -ErrorAction SilentlyContinue
+
+# one clear verdict first
+$logOff = New-Object System.Collections.Generic.List[string]
+if ($null -ne $sblVal -and [int]$sblVal -eq 0) { $logOff.Add('script block logging policy is set to 0') }
+if ($null -ne $modVal -and [int]$modVal -eq 0) { $logOff.Add('module logging policy is set to 0') }
+if ($psLog -and -not $psLog.IsEnabled) { $logOff.Add('PowerShell Operational event log is disabled') }
+if (-not $psLog) {
+    Write-Item 'LOGGING STATUS' 'UNKNOWN (could not query the Operational log)' 'Yellow'
+} elseif ($logOff.Count -gt 0) {
+    Write-Item 'LOGGING STATUS' 'DISABLED' 'Red'
+    foreach ($lo in $logOff) { Write-Item '' ("- {0}" -f $lo) 'Red' }
+} else {
+    Write-Item 'LOGGING STATUS' 'ENABLED' 'Green'
+    if ($null -eq $sblVal) { Write-Item '' '- script block logging not configured (Windows default)' 'Yellow' }
+}
+Write-Host ""
+
 Show-Policy 'Script block logging' "$polRoot\ScriptBlockLogging" 'EnableScriptBlockLogging' -FlagOff
 Show-Policy 'Module logging' "$polRoot\ModuleLogging" 'EnableModuleLogging' -FlagOff
 Show-Policy 'Transcription' "$polRoot\Transcription" 'EnableTranscripting'
 
-$psLog = Get-WinEvent -ListLog 'Microsoft-Windows-PowerShell/Operational' -ErrorAction SilentlyContinue
 if ($psLog) {
     if ($psLog.IsEnabled) { Write-Item 'PS Operational log' ("Enabled ({0} records)" -f $psLog.RecordCount) 'Green' }
     else { Write-Item 'PS Operational log' 'DISABLED' 'Red'; Add-Flag 'PowerShell Operational event log disabled' 'Red' }
 }
 
 # PSReadLine module
+$histOff = $false
 $psrl = Get-Module -ListAvailable -Name PSReadLine | Sort-Object Version -Descending | Select-Object -First 1
 if ($psrl) {
     Write-Item 'PSReadLine module' ("Installed (v{0})" -f $psrl.Version) 'Green'
@@ -739,6 +768,7 @@ if ($psrl) {
         if ($opt) {
             $hs = [string]$opt.HistorySaveStyle
             if ($hs -eq 'SaveNothing') {
+                $histOff = $true
                 Write-Item 'History save style' "$hs  << history NOT saved" $Purple
                 Add-Flag 'PSReadLine HistorySaveStyle = SaveNothing'
             } else {
@@ -749,9 +779,12 @@ if ($psrl) {
         Write-Item 'History save style' 'could not load PSReadLine in this host' 'Yellow'
     }
 } else {
+    $histOff = $true
     Write-Item 'PSReadLine module' 'NOT FOUND (command history not logged)' 'Red'
     Add-Flag 'PSReadLine module not found' 'Red'
 }
+if ($histOff) { Write-Item 'HISTORY LOGGING' 'DISABLED' 'Red' }
+else { Write-Item 'HISTORY LOGGING' 'ENABLED' 'Green' }
 
 # profile scripts that disable or redirect history
 $profFiles = New-Object System.Collections.Generic.List[string]
@@ -838,51 +871,39 @@ foreach ($u in $script:ctxUsers.Values) {
 }
 
 # ----------------------------------------------------------------------------
-# Event log checks - CURRENT BOOT ONLY (older records shown as gray context)
+# Event log checks - classic summary (everything else is in the parser window)
 # ----------------------------------------------------------------------------
-Write-Section 'EVENT LOG CHECKS (this boot)'
+Write-Section 'EVENT LOG CHECKS'
 
-function Show-Event {
-    param([string]$Log, [int[]]$Ids, [string]$Label, [string]$Provider, [switch]$Flag, [switch]$ShowId, [switch]$Info)
+function Show-LastEvent {
+    param([string]$Log, [int[]]$Ids, [string]$Found, [string]$None, [string]$Provider,
+          [ValidateSet('Tamper', 'Info')][string]$Kind = 'Tamper')
     $f = @{ LogName = $Log; Id = $Ids }
     if ($Provider) { $f.ProviderName = $Provider }
-    if (-not $Info) { $f.StartTime = $script:BootTime }
-    $evs = @(Get-WinEvent -FilterHashtable $f -MaxEvents 100 -ErrorAction SilentlyContinue)
-    Write-Host ("  {0,-44}" -f $Label) -NoNewline -ForegroundColor Gray
-    if ($evs.Count -gt 0) {
-        $e = $evs[0]
-        $txt = Fmt $e.TimeCreated
-        if ($ShowId) { $txt = "{0}  (ID {1})" -f $txt, $e.Id }
-        if ($evs.Count -gt 1 -and -not $Info) { $txt = "{0}  x{1}" -f $txt, $evs.Count }
-        $color = $Purple; if ($Info) { $color = 'Yellow' }
-        Write-Host $txt -ForegroundColor $color
-        if ($Flag) { Add-Flag ("{0} {1}" -f $Label, (Fmt $e.TimeCreated)) }
+    $e = Get-WinEvent -FilterHashtable $f -MaxEvents 1 -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $e) {
+        Write-Host $None -ForegroundColor Green
+        return
+    }
+    $t = $e.TimeCreated
+    $text = "{0} {1}" -f $Found, (Fmt $t)
+    if ($Kind -eq 'Info') {
+        Write-Host $text -ForegroundColor Cyan
+    } elseif ($t -gt $script:BootTime) {
+        Write-Host ($text + '   << after boot') -ForegroundColor $Purple
+        Add-Flag ("{0} {1}" -f $Found.TrimEnd(':'), (Fmt $t))
     } else {
-        Write-Host 'none this boot' -NoNewline -ForegroundColor Green
-        if (-not $Info) {
-            $f.Remove('StartTime')
-            $old = Get-WinEvent -FilterHashtable $f -MaxEvents 1 -ErrorAction SilentlyContinue
-            if ($old) { Write-Host ("   (last: {0})" -f (Fmt $old.TimeCreated)) -NoNewline -ForegroundColor DarkGray }
-        }
-        Write-Host ''
+        Write-Host $text -ForegroundColor Yellow
     }
 }
 
-$pnp = 'Microsoft-Windows-Kernel-PnP/Configuration'
-Show-Event -Log 'Application' -Ids 3079 -Label 'USN Journal deleted' -Flag
-Show-Event -Log 'System'      -Ids 104  -Label 'System log cleared' -Flag -ShowId
-Show-Event -Log 'Security'    -Ids 1102 -Label 'Security log cleared' -Flag -ShowId
-Show-Event -Log 'Security'    -Ids 4616 -Label 'System time changed' -Flag
-Show-Event -Log 'System'      -Ids 7045 -Provider 'Service Control Manager' -Label 'Service / driver installed' -Flag
-Show-Event -Log 'System'      -Ids 157  -Provider 'disk' -Label 'Disk surprise-removed' -Flag
-Show-Event -Log $pnp          -Ids 420  -Label 'Device deleted (Kernel-PnP)' -Flag
-Show-Event -Log 'Microsoft-Windows-VHDMP-Operational' -Ids (1..60) -Label 'Virtual disk (VHD/ISO) activity' -Flag
-Show-Event -Log 'Microsoft-Windows-TaskScheduler/Operational' -Ids 106, 141, 142 -Label 'Scheduled task created/deleted/disabled' -Flag
-Show-Event -Log 'Microsoft-Windows-Windows Defender/Operational' -Ids 5001, 5010, 5012 -Label 'Defender protection disabled' -Flag
-Show-Event -Log 'Microsoft-Windows-Windows Defender/Operational' -Ids 1116 -Label 'Defender threat detected' -Flag
-Show-Event -Log 'Microsoft-Windows-CodeIntegrity/Operational' -Ids 3001, 3002, 3003, 3004 -Label 'Code Integrity (unsigned/blocked driver)' -Flag
-Show-Event -Log 'System'      -Ids 1074 -Label 'Previous shutdown/restart (info)' -Info
-Show-Event -Log 'System'      -Ids 6005 -Label 'Event Log service started (info)' -Info
+Show-LastEvent -Log 'Application' -Ids 3079 -Found 'USN Journal last deleted at:' -None 'USN Journal last deleted - no records found'
+Show-LastEvent -Log 'System'      -Ids 104  -Found 'Event Logs last cleared (System log) (Event ID: 104) at:' -None 'Event Logs last cleared (System log) - no records found'
+Show-LastEvent -Log 'Security'    -Ids 1102 -Found 'Security log last cleared at:' -None 'Security log last cleared - no records found'
+Show-LastEvent -Log 'System'      -Ids 1074 -Found 'User recent PC shutdown at:' -None 'User recent PC shutdown - no records found' -Kind Info
+Show-LastEvent -Log 'Security'    -Ids 4616 -Found 'System time changed at:' -None 'System time changed - no records found'
+Show-LastEvent -Log 'System'      -Ids 6005 -Found 'Event Log Service started at:' -None 'Event Log Service started - no records found' -Kind Info
+Show-LastEvent -Log 'Microsoft-Windows-Kernel-PnP/Configuration' -Ids 400 -Found 'Device configuration changed at:' -None 'Device configuration changed - no records found' -Kind Info
 
 # ----------------------------------------------------------------------------
 # Prefetch integrity
@@ -957,7 +978,7 @@ Write-Host ""
 Write-Host "  Flags are indicators, not proof. Verify manually before a verdict." -ForegroundColor DarkGray
 
 # ----------------------------------------------------------------------------
-# Event log parser window (optional)
+# Event Logs Parser window (optional)
 # ----------------------------------------------------------------------------
 function Escape-Like {
     param([string]$s)
@@ -1055,6 +1076,313 @@ function Get-EventCategories {
     return $cats
 }
 
+# ---- GUI helpers (script scope so event handlers can reach them) -------------
+function Rgb { param([int]$r, [int]$g, [int]$b) [System.Drawing.Color]::FromArgb($r, $g, $b) }
+
+function Update-EvStatus {
+    $name = $script:evCurrent
+    if (-not $name) { return }
+    $shown = $script:evViews[$name].Count
+    $total = $script:evTables[$name].Rows.Count
+    $script:evStatus.Text = ("  {0}   |   showing {1} of {2} event(s)   |   Ctrl+F search   |   click a column header to sort" -f $name, $shown, $total)
+}
+
+function Update-EvDetail {
+    $g = $script:evGrid
+    $row = $g.CurrentRow
+    if (-not $row -or -not $row.DataBoundItem) {
+        $script:evDetail.Text = 'Select an event to see its full details here.'
+        return
+    }
+    $r = $row.DataBoundItem
+    $flag = ''
+    if ($r['Important'] -eq $true) { $flag = '    [IMPORTANT]' }
+    $script:evDetail.Text = ("{0}    |    Event ID {1}    |    {2}{3}`r`n`r`n{4}" -f ([datetime]$r['Time']).ToString('MM/dd/yyyy hh:mm:ss tt'), $r['Id'], $r['Source'], $flag, $r['Details'])
+}
+
+function Update-EvFilter {
+    $t = Escape-Like $script:evSearch.Text
+    $parts = @()
+    if ($t) { $parts += "(Details LIKE '%$t%' OR Source LIKE '%$t%' OR Convert(Id, 'System.String') LIKE '%$t%')" }
+    if ($script:evImpOnly.Checked) { $parts += 'Important = true' }
+    $flt = $parts -join ' AND '
+    foreach ($k in $script:evViews.Keys) {
+        $script:evViews[$k].RowFilter = $flt
+        $script:evBtns[$k].Count = [string]$script:evViews[$k].Count
+        $script:evBtns[$k].Invalidate()
+    }
+    Update-EvStatus
+    Update-EvDetail
+}
+
+function Set-EvTab {
+    param([string]$Name)
+    $script:evCurrent = $Name
+    foreach ($k in $script:evBtns.Keys) {
+        $script:evBtns[$k].Active = ($k -eq $Name)
+        $script:evBtns[$k].Invalidate()
+    }
+    $script:evGrid.DataSource = $script:evViews[$Name]
+    Update-EvStatus
+    Update-EvDetail
+}
+
+function Export-EvTab {
+    $name = $script:evCurrent
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'CSV (*.csv)|*.csv'
+    $dlg.FileName = ("EventLogs_{0}.csv" -f ($name -replace '[^A-Za-z0-9]+', '_'))
+    if ($dlg.ShowDialog() -eq 'OK') {
+        $rows = foreach ($r in $script:evViews[$name]) {
+            [pscustomobject]@{ Time = $r['Time']; Id = $r['Id']; Source = $r['Source']; Details = $r['Details']; Important = $r['Important'] }
+        }
+        $rows | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding UTF8
+    }
+}
+
+function Export-EvAll {
+    $dlg = New-Object System.Windows.Forms.SaveFileDialog
+    $dlg.Filter = 'CSV (*.csv)|*.csv'
+    $dlg.FileName = 'EventLogs_All.csv'
+    if ($dlg.ShowDialog() -eq 'OK') {
+        $rows = foreach ($name in $script:evTables.Keys) {
+            if ($name -eq 'Important') { continue }
+            foreach ($r in $script:evTables[$name].Rows) {
+                [pscustomobject]@{ Category = $name; Time = $r['Time']; Id = $r['Id']; Source = $r['Source']; Details = $r['Details']; Important = $r['Important'] }
+            }
+        }
+        $rows | Sort-Object Time -Descending | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding UTF8
+    }
+}
+
+$script:UiSource = @'
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Windows.Forms;
+using System.Runtime.InteropServices;
+
+namespace SSCheck {
+    public static class Gfx {
+        public static GraphicsPath Round(RectangleF r, float rad) {
+            GraphicsPath p = new GraphicsPath();
+            float d = rad * 2f;
+            if (rad <= 0f || d > r.Width || d > r.Height) { p.AddRectangle(r); return p; }
+            p.AddArc(r.X, r.Y, d, d, 180, 90);
+            p.AddArc(r.Right - d, r.Y, d, d, 270, 90);
+            p.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            p.AddArc(r.X, r.Bottom - d, d, d, 90, 90);
+            p.CloseFigure();
+            return p;
+        }
+
+        public static void Glow(Graphics g, float cx, float cy, float rad, Color c, int alpha) {
+            using (GraphicsPath gp = new GraphicsPath()) {
+                gp.AddEllipse(cx - rad, cy - rad, rad * 2f, rad * 2f);
+                using (PathGradientBrush pb = new PathGradientBrush(gp)) {
+                    pb.CenterColor = Color.FromArgb(alpha, c);
+                    pb.SurroundColors = new Color[] { Color.FromArgb(0, c) };
+                    g.FillPath(pb, gp);
+                }
+            }
+        }
+    }
+
+    // Animated holographic purple background with the window header painted on it
+    public class HoloPanel : Panel {
+        public float Phase = 0f;
+        public string Title = "";
+        public string Subtitle = "";
+        public string[] Chips = new string[0];
+
+        public HoloPanel() {
+            SetStyle(ControlStyles.AllPaintingInWmPaint | ControlStyles.UserPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        }
+
+        protected override void OnPaint(PaintEventArgs e) {
+            Graphics g = e.Graphics;
+            Rectangle rc = ClientRectangle;
+            if (rc.Width < 4 || rc.Height < 4) return;
+            float w = rc.Width, h = rc.Height;
+
+            // iridescent base: deep indigo -> violet -> magenta -> icy cyan glint -> violet
+            g.SmoothingMode = SmoothingMode.None;
+            using (LinearGradientBrush b = new LinearGradientBrush(rc, Color.Black, Color.Black, 24f)) {
+                ColorBlend cb = new ColorBlend();
+                cb.Colors = new Color[] {
+                    Color.FromArgb(14, 8, 34), Color.FromArgb(48, 18, 104), Color.FromArgb(110, 48, 200), Color.FromArgb(182, 74, 216),
+                    Color.FromArgb(78, 176, 232), Color.FromArgb(124, 58, 212), Color.FromArgb(42, 14, 92), Color.FromArgb(14, 8, 34) };
+                cb.Positions = new float[] { 0f, 0.16f, 0.34f, 0.5f, 0.62f, 0.78f, 0.9f, 1f };
+                b.InterpolationColors = cb;
+                b.WrapMode = WrapMode.TileFlipXY;
+                b.TranslateTransform(Phase * w, 0f);
+                g.FillRectangle(b, rc);
+            }
+
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            Gfx.Glow(g, w * (0.16f + Phase), 30f, 280f, Color.FromArgb(255, 70, 200), 80);
+            Gfx.Glow(g, w * (0.60f - Phase), 20f, 320f, Color.FromArgb(70, 210, 255), 62);
+            Gfx.Glow(g, w * (0.92f + Phase * 0.5f), h * 0.85f, 360f, Color.FromArgb(150, 80, 255), 80);
+            Gfx.Glow(g, w * 0.05f, h * 0.95f, 300f, Color.FromArgb(220, 80, 255), 60);
+
+            // fine scanlines for the hologram feel
+            g.SmoothingMode = SmoothingMode.None;
+            using (Pen sp = new Pen(Color.FromArgb(34, 0, 0, 0), 1f)) {
+                for (int y = 0; y < rc.Height; y += 3) g.DrawLine(sp, 0, y, rc.Width, y);
+            }
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+
+            // title with soft glow and gradient fill
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+            using (GraphicsPath tp = new GraphicsPath()) {
+                using (FontFamily ff = new FontFamily("Segoe UI")) {
+                    tp.AddString(Title, ff, (int)FontStyle.Bold, 25f, new PointF(26f, 15f), StringFormat.GenericTypographic);
+                }
+                RectangleF tb = tp.GetBounds();
+                using (Pen glow = new Pen(Color.FromArgb(70, 230, 130, 255), 7f)) {
+                    glow.LineJoin = LineJoin.Round;
+                    g.DrawPath(glow, tp);
+                }
+                if (tb.Width > 2f) {
+                    using (LinearGradientBrush tg = new LinearGradientBrush(new RectangleF(tb.X, tb.Y, tb.Width, tb.Height + 1f), Color.White, Color.White, 0f)) {
+                        ColorBlend tc = new ColorBlend();
+                        tc.Colors = new Color[] { Color.FromArgb(240, 232, 255), Color.FromArgb(160, 232, 255), Color.FromArgb(196, 150, 255), Color.FromArgb(255, 150, 224) };
+                        tc.Positions = new float[] { 0f, 0.35f, 0.7f, 1f };
+                        tg.InterpolationColors = tc;
+                        g.FillPath(tg, tp);
+                    }
+                }
+            }
+
+            using (Font sf = new Font("Segoe UI", 9.5f))
+            using (SolidBrush sb = new SolidBrush(Color.FromArgb(222, 208, 255))) {
+                g.DrawString(Subtitle, sf, sb, 28f, 64f);
+            }
+
+            // stat chips, right aligned
+            float x = w - 26f;
+            using (Font cf = new Font("Segoe UI Semibold", 9f)) {
+                for (int i = Chips.Length - 1; i >= 0; i--) {
+                    string t = Chips[i];
+                    bool hot = t.StartsWith("!");
+                    if (hot) t = t.Substring(1);
+                    SizeF sz = g.MeasureString(t, cf);
+                    float cw = sz.Width + 28f;
+                    RectangleF cr = new RectangleF(x - cw, 22f, cw, 30f);
+                    x -= cw + 10f;
+                    using (GraphicsPath cp = Gfx.Round(cr, 15f)) {
+                        using (SolidBrush fb = new SolidBrush(hot ? Color.FromArgb(160, 120, 18, 72) : Color.FromArgb(120, 14, 8, 36))) g.FillPath(fb, cp);
+                        using (Pen bp = new Pen(hot ? Color.FromArgb(255, 110, 170) : Color.FromArgb(170, 150, 120, 255), 1.2f)) g.DrawPath(bp, cp);
+                    }
+                    using (SolidBrush ts = new SolidBrush(hot ? Color.FromArgb(255, 214, 232) : Color.FromArgb(238, 228, 255))) {
+                        g.DrawString(t, cf, ts, cr.X + 14f, cr.Y + 6f);
+                    }
+                }
+            }
+        }
+    }
+
+    // Sidebar category pill (Side = true) or gradient action button (Side = false)
+    public class HoloButton : Button {
+        public string Caption = "";
+        public string Count = "";
+        public bool Active = false;
+        public bool Side = false;
+        public bool Hot = false;
+        private bool hover = false;
+
+        public HoloButton() {
+            SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint | ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+            FlatStyle = FlatStyle.Flat;
+            FlatAppearance.BorderSize = 0;
+            TabStop = false;
+            Cursor = Cursors.Hand;
+        }
+
+        protected override void OnMouseEnter(EventArgs e) { hover = true; Invalidate(); base.OnMouseEnter(e); }
+        protected override void OnMouseLeave(EventArgs e) { hover = false; Invalidate(); base.OnMouseLeave(e); }
+
+        protected override void OnPaint(PaintEventArgs pe) {
+            Graphics g = pe.Graphics;
+            g.Clear(BackColor);
+            if (Width < 8 || Height < 8) return;
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+            RectangleF r = new RectangleF(1f, 1f, Width - 3f, Height - 3f);
+            Color accent = Hot ? Color.FromArgb(255, 96, 160) : Color.FromArgb(160, 100, 255);
+
+            using (StringFormat sf = new StringFormat()) {
+                sf.LineAlignment = StringAlignment.Center;
+                sf.Trimming = StringTrimming.EllipsisCharacter;
+                sf.FormatFlags = StringFormatFlags.NoWrap;
+
+                if (Side) {
+                    if (Active) {
+                        using (GraphicsPath gp = Gfx.Round(r, 9f))
+                        using (LinearGradientBrush lb = new LinearGradientBrush(r, Color.FromArgb(120, accent), Color.FromArgb(16, accent), 0f)) {
+                            g.FillPath(lb, gp);
+                        }
+                        using (SolidBrush ab = new SolidBrush(accent)) { g.FillRectangle(ab, 1f, 8f, 3f, Height - 17f); }
+                    } else if (hover) {
+                        using (GraphicsPath gp = Gfx.Round(r, 9f))
+                        using (SolidBrush hb = new SolidBrush(Color.FromArgb(26, 190, 160, 255))) {
+                            g.FillPath(hb, gp);
+                        }
+                    }
+                    Color tcol = Active ? Color.White : Color.FromArgb(198, 186, 238);
+                    using (Font f = new Font("Segoe UI", 9.5f, Active ? FontStyle.Bold : FontStyle.Regular))
+                    using (SolidBrush tbr = new SolidBrush(tcol)) {
+                        g.DrawString(Caption, f, tbr, new RectangleF(16f, 0f, Width - 74f, Height), sf);
+                    }
+                    if (Count.Length > 0) {
+                        bool zero = (Count == "0");
+                        using (Font cf = new Font("Segoe UI Semibold", 8.5f))
+                        using (StringFormat cs = new StringFormat()) {
+                            cs.Alignment = StringAlignment.Center;
+                            cs.LineAlignment = StringAlignment.Center;
+                            SizeF sz = g.MeasureString(Count, cf);
+                            float bw = Math.Max(28f, sz.Width + 14f);
+                            RectangleF br = new RectangleF(Width - bw - 10f, (Height - 20f) / 2f, bw, 20f);
+                            Color fill = zero ? Color.FromArgb(40, 150, 130, 200) : Color.FromArgb(Active ? 230 : 150, accent);
+                            using (GraphicsPath bp = Gfx.Round(br, 10f))
+                            using (SolidBrush bb = new SolidBrush(fill)) {
+                                g.FillPath(bb, bp);
+                            }
+                            using (SolidBrush cb = new SolidBrush(zero ? Color.FromArgb(150, 140, 190) : Color.White)) {
+                                g.DrawString(Count, cf, cb, br, cs);
+                            }
+                        }
+                    }
+                } else {
+                    Color c1 = hover ? Color.FromArgb(152, 102, 255) : Color.FromArgb(118, 70, 230);
+                    Color c2 = hover ? Color.FromArgb(236, 92, 214) : Color.FromArgb(190, 64, 190);
+                    using (GraphicsPath gp = Gfx.Round(r, 10f))
+                    using (LinearGradientBrush lb = new LinearGradientBrush(r, c1, c2, 0f)) {
+                        g.FillPath(lb, gp);
+                    }
+                    sf.Alignment = StringAlignment.Center;
+                    using (Font f = new Font("Segoe UI Semibold", 9.5f))
+                    using (SolidBrush tb = new SolidBrush(Color.White)) {
+                        g.DrawString(Caption, f, tb, new RectangleF(0f, 0f, Width, Height), sf);
+                    }
+                }
+            }
+        }
+    }
+
+    // Text box with a grey placeholder (cue banner)
+    public class CueTextBox : TextBox {
+        public string Cue = "";
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern IntPtr SendMessage(IntPtr hWnd, int msg, IntPtr wParam, string lParam);
+        protected override void OnHandleCreated(EventArgs e) {
+            base.OnHandleCreated(e);
+            if (Cue.Length > 0) SendMessage(Handle, 0x1501, (IntPtr)1, Cue);
+        }
+    }
+}
+'@
+
 function Show-EventParser {
     if ([System.Threading.Thread]::CurrentThread.GetApartmentState() -ne 'STA') {
         Write-Host "  This PowerShell host is not STA. Re-run with: powershell.exe -STA" -ForegroundColor Yellow
@@ -1064,6 +1392,16 @@ function Show-EventParser {
     Add-Type -AssemblyName System.Drawing
     [System.Windows.Forms.Application]::EnableVisualStyles()
 
+    if (-not ('SSCheck.HoloPanel' -as [type])) {
+        try {
+            Add-Type -TypeDefinition $script:UiSource -ReferencedAssemblies 'System.Windows.Forms', 'System.Drawing' -ErrorAction Stop
+        } catch {
+            Write-Host "  Could not build the parser window: $($_.Exception.Message)" -ForegroundColor Red
+            return
+        }
+    }
+
+    # ---- collect events
     $cats = Get-EventCategories
     $tables = [ordered]@{}
     $i = 0
@@ -1099,170 +1437,329 @@ function Show-EventParser {
     }
     Write-Progress -Activity 'Parsing event logs (this boot)' -Completed
 
-    # "Important" overview tab = every flagged row from all tabs
+    # "Important" overview = every flagged row from all tabs
     $imp = New-Object System.Data.DataTable
     [void]$imp.Columns.Add('Time', [datetime])
     [void]$imp.Columns.Add('Id', [int])
     [void]$imp.Columns.Add('Source', [string])
     [void]$imp.Columns.Add('Details', [string])
     [void]$imp.Columns.Add('Important', [bool])
+    $totalEvents = 0
     foreach ($name in $tables.Keys) {
+        $totalEvents += $tables[$name].Rows.Count
         foreach ($row in $tables[$name].Rows) {
             if ($row['Important']) {
                 [void]$imp.Rows.Add($row['Time'], $row['Id'], ("[{0}] {1}" -f $name, $row['Source']), $row['Details'], $true)
             }
         }
     }
-    $all = [ordered]@{}
-    $all['Important'] = $imp
-    foreach ($name in $tables.Keys) { $all[$name] = $tables[$name] }
+    $script:evTables = [ordered]@{}
+    $script:evTables['Important'] = $imp
+    foreach ($name in $tables.Keys) { $script:evTables[$name] = $tables[$name] }
 
-    # ---- window
-    $bg   = [System.Drawing.Color]::FromArgb(20, 22, 28)
-    $bg2  = [System.Drawing.Color]::FromArgb(31, 36, 48)
-    $fg   = [System.Drawing.Color]::FromArgb(230, 232, 238)
-    $impB = [System.Drawing.Color]::FromArgb(74, 22, 32)
-    $impF = [System.Drawing.Color]::FromArgb(255, 179, 189)
-
-    $form = New-Object System.Windows.Forms.Form
-    $form.Text = 'SS CHECK - Event Log Parser (current boot)'
-    $form.Size = New-Object System.Drawing.Size(1320, 780)
-    $form.StartPosition = 'CenterScreen'
-    $form.BackColor = $bg
-    $form.ForeColor = $fg
-    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
-
-    $tabs = New-Object System.Windows.Forms.TabControl
-    $tabs.Dock = 'Fill'
-    $script:evViews = New-Object System.Collections.Generic.List[object]
-    $script:evNames = New-Object System.Collections.Generic.List[string]
-
-    foreach ($name in $all.Keys) {
-        $dtab = $all[$name]
-        $dv = New-Object System.Data.DataView($dtab)
+    $script:evViews = [ordered]@{}
+    foreach ($name in $script:evTables.Keys) {
+        $dv = New-Object System.Data.DataView($script:evTables[$name])
         $dv.Sort = 'Time DESC'
-        $script:evViews.Add($dv)
-        $script:evNames.Add($name)
-
-        $grid = New-Object System.Windows.Forms.DataGridView
-        $grid.Dock = 'Fill'
-        $grid.ReadOnly = $true
-        $grid.AllowUserToAddRows = $false
-        $grid.AllowUserToDeleteRows = $false
-        $grid.RowHeadersVisible = $false
-        $grid.SelectionMode = 'FullRowSelect'
-        $grid.BorderStyle = 'None'
-        $grid.BackgroundColor = $bg
-        $grid.GridColor = $bg2
-        $grid.EnableHeadersVisualStyles = $false
-        $grid.ColumnHeadersDefaultCellStyle.BackColor = $bg2
-        $grid.ColumnHeadersDefaultCellStyle.ForeColor = $fg
-        $grid.ColumnHeadersHeight = 28
-        $grid.DefaultCellStyle.BackColor = $bg
-        $grid.DefaultCellStyle.ForeColor = $fg
-        $grid.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(52, 74, 130)
-        $grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
-        $grid.DataSource = $dv
-        $grid.AutoSizeColumnsMode = 'None'
-        $grid.Columns['Time'].Width = 160
-        $grid.Columns['Time'].DefaultCellStyle.Format = 'MM/dd/yyyy hh:mm:ss tt'
-        $grid.Columns['Id'].Width = 60
-        $grid.Columns['Source'].Width = 240
-        $grid.Columns['Important'].Visible = $false
-        $grid.Columns['Details'].AutoSizeMode = 'Fill'
-        $grid.Add_DataBindingComplete({
-            param($s, $e)
-            foreach ($r in $s.Rows) {
-                $item = $r.DataBoundItem
-                if ($item -and $item['Important'] -eq $true) {
-                    $r.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(74, 22, 32)
-                    $r.DefaultCellStyle.ForeColor = [System.Drawing.Color]::FromArgb(255, 179, 189)
-                }
-            }
-        })
-        $grid.Add_CellDoubleClick({
-            param($s, $e)
-            if ($e.RowIndex -ge 0) {
-                $txt = "{0}`r`nID {1} - {2}`r`n`r`n{3}" -f $s.Rows[$e.RowIndex].Cells['Time'].Value, $s.Rows[$e.RowIndex].Cells['Id'].Value, $s.Rows[$e.RowIndex].Cells['Source'].Value, $s.Rows[$e.RowIndex].Cells['Details'].Value
-                [void][System.Windows.Forms.MessageBox]::Show($txt, 'Event details')
-            }
-        })
-
-        $page = New-Object System.Windows.Forms.TabPage
-        $page.Text = ("{0} ({1})" -f $name, $dtab.Rows.Count)
-        $page.BackColor = $bg
-        $page.Controls.Add($grid)
-        $tabs.TabPages.Add($page)
+        $script:evViews[$name] = $dv
     }
 
-    $top = New-Object System.Windows.Forms.Panel
-    $top.Dock = 'Top'
-    $top.Height = 48
-    $top.BackColor = $bg2
+    # ---- palette
+    $cBg     = Rgb 14 8 32
+    $cCard   = Rgb 17 10 36
+    $cSide   = Rgb 13 8 29
+    $cField  = Rgb 32 21 64
+    $cRow    = Rgb 21 13 43
+    $cRowAlt = Rgb 26 17 51
+    $cText   = Rgb 232 224 255
+    $cDim    = Rgb 150 132 205
 
-    $lbl = New-Object System.Windows.Forms.Label
-    $lbl.AutoSize = $true
-    $lbl.Location = New-Object System.Drawing.Point(12, 15)
-    $lbl.Text = ("Boot: {0}   |   important: {1}" -f $script:BootTime.ToString('yyyy-MM-dd hh:mm tt'), $imp.Rows.Count)
-    $top.Controls.Add($lbl)
+    # ---- window
+    $form = New-Object System.Windows.Forms.Form
+    $form.Text = 'Event Logs Parser'
+    $form.Size = New-Object System.Drawing.Size(1380, 840)
+    $form.MinimumSize = New-Object System.Drawing.Size(1020, 640)
+    $form.StartPosition = 'CenterScreen'
+    $form.BackColor = $cBg
+    $form.ForeColor = $cText
+    $form.Font = New-Object System.Drawing.Font('Segoe UI', 9)
+    $form.KeyPreview = $true
 
-    $filterBox = New-Object System.Windows.Forms.TextBox
-    $filterBox.Location = New-Object System.Drawing.Point(430, 12)
-    $filterBox.Width = 300
-    $filterBox.BackColor = $bg
-    $filterBox.ForeColor = $fg
-    $top.Controls.Add($filterBox)
+    # holographic background + header (painted by the control)
+    $holo = New-Object SSCheck.HoloPanel
+    $holo.Dock = 'Fill'
+    $holo.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 22, 106, 22, 22
+    $titleText = (('Event Logs Parser'.ToUpper() -split ' ' | ForEach-Object { ($_.ToCharArray() -join ' ') }) -join '   ')
+    $holo.Title = $titleText
+    $holo.Subtitle = 'Disks, USB, virtual mounts, services, security, Defender, PowerShell and more  -  events from the current boot'
+    $holo.Chips = [string[]]@(
+        ('BOOT  ' + $script:BootTime.ToString('MM/dd  hh:mm tt')),
+        ('{0}  EVENTS' -f $totalEvents),
+        ('!{0}  IMPORTANT' -f $imp.Rows.Count)
+    )
+    $script:evHolo = $holo
 
-    $hint = New-Object System.Windows.Forms.Label
-    $hint.AutoSize = $true
-    $hint.Location = New-Object System.Drawing.Point(738, 15)
-    $hint.Text = '<- filter (source / details / id)'
-    $hint.ForeColor = [System.Drawing.Color]::Gray
-    $top.Controls.Add($hint)
+    # neon edge around the card
+    $edge = New-Object System.Windows.Forms.Panel
+    $edge.Dock = 'Fill'
+    $edge.BackColor = Rgb 138 84 235
+    $edge.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 1, 1, 1, 1
 
-    $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = 'Export tab to CSV'
-    $btn.Width = 130
-    $btn.Location = New-Object System.Drawing.Point(1000, 10)
-    $btn.FlatStyle = 'Flat'
-    $btn.BackColor = $bg
-    $btn.ForeColor = $fg
-    $top.Controls.Add($btn)
+    $card = New-Object System.Windows.Forms.Panel
+    $card.Dock = 'Fill'
+    $card.BackColor = $cCard
 
-    $script:evFilterBox = $filterBox
-    $script:evTabs = $tabs
-    $filterBox.Add_TextChanged({
-        $t = Escape-Like $script:evFilterBox.Text
-        foreach ($v in $script:evViews) {
-            if ($t) { $v.RowFilter = "Details LIKE '%$t%' OR Source LIKE '%$t%' OR Convert(Id, 'System.String') LIKE '%$t%'" }
-            else { $v.RowFilter = '' }
-        }
-    })
+    $root = New-Object System.Windows.Forms.TableLayoutPanel
+    $root.Dock = 'Fill'
+    $root.BackColor = $cCard
+    $root.ColumnCount = 2
+    $root.RowCount = 1
+    [void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 232)))
+    [void]$root.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$root.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
 
-    $btn.Add_Click({
-        $idx = $script:evTabs.SelectedIndex
-        if ($idx -lt 0) { return }
-        $dlg = New-Object System.Windows.Forms.SaveFileDialog
-        $dlg.Filter = 'CSV (*.csv)|*.csv'
-        $dlg.FileName = ("SSCheck_{0}.csv" -f ($script:evNames[$idx] -replace '[^A-Za-z0-9]+', '_'))
-        if ($dlg.ShowDialog() -eq 'OK') {
-            $rows = foreach ($r in $script:evViews[$idx]) {
-                [pscustomobject]@{ Time = $r['Time']; Id = $r['Id']; Source = $r['Source']; Details = $r['Details']; Important = $r['Important'] }
+    # ---- sidebar with categories
+    $side = New-Object System.Windows.Forms.FlowLayoutPanel
+    $side.Dock = 'Fill'
+    $side.FlowDirection = 'TopDown'
+    $side.WrapContents = $false
+    $side.AutoScroll = $true
+    $side.BackColor = $cSide
+    $side.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 10, 14, 4, 10
+    $side.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 0, 0, 0, 0
+
+    $sideHead = New-Object System.Windows.Forms.Label
+    $sideHead.Text = 'CATEGORIES'
+    $sideHead.AutoSize = $false
+    $sideHead.Width = 192
+    $sideHead.Height = 26
+    $sideHead.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 8, 4, 0, 0
+    $sideHead.BackColor = $cSide
+    $sideHead.ForeColor = $cDim
+    $sideHead.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 8)
+    $side.Controls.Add($sideHead)
+
+    $script:evBtns = [ordered]@{}
+    foreach ($name in $script:evTables.Keys) {
+        $b = New-Object SSCheck.HoloButton
+        $b.Side = $true
+        $b.Caption = $name
+        $b.Count = [string]$script:evTables[$name].Rows.Count
+        $b.Hot = ($name -eq 'Important')
+        $b.Tag = $name
+        $b.Width = 192
+        $b.Height = 38
+        $b.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 0, 0, 0, 3
+        $b.BackColor = $cSide
+        $b.Add_Click({ Set-EvTab ([string]$this.Tag) })
+        $script:evBtns[$name] = $b
+        $side.Controls.Add($b)
+    }
+
+    # ---- main area (toolbar / grid / details / status)
+    $main = New-Object System.Windows.Forms.TableLayoutPanel
+    $main.Dock = 'Fill'
+    $main.BackColor = $cCard
+    $main.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 14, 10, 14, 6
+    $main.ColumnCount = 1
+    $main.RowCount = 4
+    [void]$main.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 56)))
+    [void]$main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 150)))
+    [void]$main.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Absolute, 26)))
+
+    # toolbar
+    $tool = New-Object System.Windows.Forms.TableLayoutPanel
+    $tool.Dock = 'Fill'
+    $tool.BackColor = $cCard
+    $tool.ColumnCount = 4
+    $tool.RowCount = 1
+    [void]$tool.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$tool.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 140)))
+    [void]$tool.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 122)))
+    [void]$tool.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Absolute, 122)))
+    [void]$tool.RowStyles.Add((New-Object System.Windows.Forms.RowStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+
+    $sbox = New-Object System.Windows.Forms.Panel
+    $sbox.Dock = 'Fill'
+    $sbox.BackColor = $cField
+    $sbox.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 14, 11, 14, 4
+    $sbox.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 0, 4, 10, 4
+    $search = New-Object SSCheck.CueTextBox
+    $search.Cue = 'Search events by source, ID or details...'
+    $search.Dock = 'Fill'
+    $search.BorderStyle = 'None'
+    $search.BackColor = $cField
+    $search.ForeColor = $cText
+    $search.Font = New-Object System.Drawing.Font('Segoe UI', 10.5)
+    $sbox.Controls.Add($search)
+    $script:evSearch = $search
+
+    $chk = New-Object System.Windows.Forms.CheckBox
+    $chk.Text = 'Important only'
+    $chk.Dock = 'Fill'
+    $chk.FlatStyle = 'Flat'
+    $chk.BackColor = $cCard
+    $chk.ForeColor = Rgb 255 170 205
+    $chk.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 9.5)
+    $chk.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 0, 4, 6, 4
+    $script:evImpOnly = $chk
+
+    $btnTab = New-Object SSCheck.HoloButton
+    $btnTab.Caption = 'Export tab'
+    $btnTab.Dock = 'Fill'
+    $btnTab.BackColor = $cCard
+    $btnTab.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 0, 6, 8, 6
+    $btnTab.Add_Click({ Export-EvTab })
+
+    $btnAll = New-Object SSCheck.HoloButton
+    $btnAll.Caption = 'Export all'
+    $btnAll.Dock = 'Fill'
+    $btnAll.BackColor = $cCard
+    $btnAll.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 0, 6, 0, 6
+    $btnAll.Add_Click({ Export-EvAll })
+
+    $tool.Controls.Add($sbox, 0, 0)
+    $tool.Controls.Add($chk, 1, 0)
+    $tool.Controls.Add($btnTab, 2, 0)
+    $tool.Controls.Add($btnAll, 3, 0)
+
+    # grid
+    $grid = New-Object System.Windows.Forms.DataGridView
+    $grid.Dock = 'Fill'
+    $grid.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 0, 4, 0, 6
+    $grid.ReadOnly = $true
+    $grid.AutoGenerateColumns = $false
+    $grid.AllowUserToAddRows = $false
+    $grid.AllowUserToDeleteRows = $false
+    $grid.AllowUserToResizeRows = $false
+    $grid.MultiSelect = $false
+    $grid.RowHeadersVisible = $false
+    $grid.SelectionMode = 'FullRowSelect'
+    $grid.BorderStyle = 'None'
+    $grid.CellBorderStyle = 'SingleHorizontal'
+    $grid.BackgroundColor = $cRow
+    $grid.GridColor = Rgb 42 28 80
+    $grid.EnableHeadersVisualStyles = $false
+    $grid.ColumnHeadersBorderStyle = 'None'
+    $grid.ColumnHeadersHeightSizeMode = 'DisableResizing'
+    $grid.ColumnHeadersHeight = 34
+    $grid.RowTemplate.Height = 28
+    $hs = $grid.ColumnHeadersDefaultCellStyle
+    $hs.BackColor = Rgb 34 20 72
+    $hs.ForeColor = Rgb 196 176 255
+    $hs.SelectionBackColor = Rgb 34 20 72
+    $hs.SelectionForeColor = Rgb 196 176 255
+    $hs.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 8.5)
+    $hs.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 8, 0, 0, 0
+    $grid.DefaultCellStyle.BackColor = $cRow
+    $grid.DefaultCellStyle.ForeColor = $cText
+    $grid.DefaultCellStyle.SelectionBackColor = Rgb 104 58 205
+    $grid.DefaultCellStyle.SelectionForeColor = [System.Drawing.Color]::White
+    $grid.DefaultCellStyle.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 8, 0, 8, 0
+    $grid.AlternatingRowsDefaultCellStyle.BackColor = $cRowAlt
+    $grid.AlternatingRowsDefaultCellStyle.SelectionBackColor = Rgb 104 58 205
+    try { $grid.GetType().GetProperty('DoubleBuffered', [Reflection.BindingFlags]'Instance,NonPublic').SetValue($grid, $true, $null) } catch {}
+
+    $colDefs = @(
+        @{ Name = 'Time';    Header = 'TIME';    Width = 176; Fmt = 'MM/dd/yyyy hh:mm:ss tt' },
+        @{ Name = 'Id';      Header = 'ID';      Width = 64;  Fmt = '' },
+        @{ Name = 'Source';  Header = 'SOURCE';  Width = 250; Fmt = '' },
+        @{ Name = 'Details'; Header = 'DETAILS'; Width = 0;   Fmt = '' }
+    )
+    foreach ($cd in $colDefs) {
+        $col = New-Object System.Windows.Forms.DataGridViewTextBoxColumn
+        $col.Name = $cd.Name
+        $col.DataPropertyName = $cd.Name
+        $col.HeaderText = $cd.Header
+        if ($cd.Width -gt 0) { $col.Width = $cd.Width } else { $col.AutoSizeMode = 'Fill'; $col.MinimumWidth = 200 }
+        if ($cd.Fmt) { $col.DefaultCellStyle.Format = $cd.Fmt }
+        [void]$grid.Columns.Add($col)
+    }
+    $grid.Add_DataBindingComplete({
+        param($s, $e)
+        foreach ($r in $s.Rows) {
+            $item = $r.DataBoundItem
+            if ($item -and $item['Important'] -eq $true) {
+                $r.DefaultCellStyle.BackColor = [System.Drawing.Color]::FromArgb(62, 18, 52)
+                $r.DefaultCellStyle.ForeColor = [System.Drawing.Color]::FromArgb(255, 190, 220)
+                $r.DefaultCellStyle.SelectionBackColor = [System.Drawing.Color]::FromArgb(176, 54, 140)
             }
-            $rows | Export-Csv -LiteralPath $dlg.FileName -NoTypeInformation -Encoding UTF8
         }
     })
+    $grid.Add_SelectionChanged({ Update-EvDetail })
+    $script:evGrid = $grid
 
-    # the Fill control is added first, then the Top panel, so docking resolves correctly
-    $form.Controls.Add($tabs)
-    $form.Controls.Add($top)
+    # details pane
+    $dbox = New-Object System.Windows.Forms.Panel
+    $dbox.Dock = 'Fill'
+    $dbox.BackColor = Rgb 22 14 46
+    $dbox.Padding = New-Object System.Windows.Forms.Padding -ArgumentList 16, 12, 16, 10
+    $dbox.Margin = New-Object System.Windows.Forms.Padding -ArgumentList 0, 0, 0, 4
+    $detail = New-Object System.Windows.Forms.TextBox
+    $detail.Dock = 'Fill'
+    $detail.Multiline = $true
+    $detail.ReadOnly = $true
+    $detail.ScrollBars = 'Vertical'
+    $detail.BorderStyle = 'None'
+    $detail.BackColor = Rgb 22 14 46
+    $detail.ForeColor = Rgb 226 216 255
+    $detail.Font = New-Object System.Drawing.Font('Consolas', 10)
+    $dbox.Controls.Add($detail)
+    $script:evDetail = $detail
+
+    # status line
+    $status = New-Object System.Windows.Forms.Label
+    $status.Dock = 'Fill'
+    $status.TextAlign = 'MiddleLeft'
+    $status.BackColor = $cCard
+    $status.ForeColor = $cDim
+    $status.Font = New-Object System.Drawing.Font('Segoe UI', 8.5)
+    $script:evStatus = $status
+
+    $main.Controls.Add($tool, 0, 0)
+    $main.Controls.Add($grid, 0, 1)
+    $main.Controls.Add($dbox, 0, 2)
+    $main.Controls.Add($status, 0, 3)
+
+    $root.Controls.Add($side, 0, 0)
+    $root.Controls.Add($main, 1, 0)
+    $card.Controls.Add($root)
+    $edge.Controls.Add($card)
+    $holo.Controls.Add($edge)
+    $form.Controls.Add($holo)
+
+    # ---- events
+    $search.Add_TextChanged({ Update-EvFilter })
+    $chk.Add_CheckedChanged({ Update-EvFilter })
+    $form.Add_KeyDown({
+        param($s, $e)
+        if ($e.Control -and $e.KeyCode -eq 'F') { $script:evSearch.Focus(); $e.SuppressKeyPress = $true }
+    })
+
+    # slow holographic drift
+    $script:holoT = 0.0
+    $script:evTimer = New-Object System.Windows.Forms.Timer
+    $script:evTimer.Interval = 66
+    $script:evTimer.Add_Tick({
+        $script:holoT += 0.045
+        $script:evHolo.Phase = [single](0.28 * [Math]::Sin($script:holoT))
+        $script:evHolo.Invalidate($false)
+    })
+    $form.Add_FormClosed({ $script:evTimer.Stop(); $script:evTimer.Dispose() })
+
+    Set-EvTab 'Important'
+    Update-EvFilter
+    $script:evTimer.Start()
+
     [void]$form.ShowDialog()
     $form.Dispose()
 }
 
 Write-Host ""
-Write-Host "  Parse event logs now? A window will open with disk/USB/virtual-mount" -ForegroundColor Cyan
-Write-Host "  and other system, security and application events from THIS BOOT." -ForegroundColor Cyan
+Write-Host "  Parse event logs now? The Event Logs Parser window will open with disk, USB," -ForegroundColor Cyan
+Write-Host "  virtual mount and other system, security and application events from THIS BOOT." -ForegroundColor Cyan
 $ans = Read-Host "  (Y/N)"
 if ($ans -match '^\s*(y|yes)\s*$') {
     Show-EventParser
